@@ -1,15 +1,14 @@
 package server
 
 import (
+	"context"
+	"sync"
 	"time"
 
 	"github.com/micro/go-micro/broker"
 	"github.com/micro/go-micro/codec"
 	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/server/debug"
 	"github.com/micro/go-micro/transport"
-
-	"golang.org/x/net/context"
 )
 
 type Options struct {
@@ -26,10 +25,15 @@ type Options struct {
 	HdlrWrappers []HandlerWrapper
 	SubWrappers  []SubscriberWrapper
 
+	// RegisterCheck runs a check function before registering the service
+	RegisterCheck func(context.Context) error
+	// The register expiry time
 	RegisterTTL time.Duration
+	// The interval on which to register
+	RegisterInterval time.Duration
 
-	// Debug Handler which can be set by a user
-	DebugHandler debug.DebugHandler
+	// The router for requests
+	Router Router
 
 	// Other options for implementations of the interface
 	// can be stored in a context
@@ -38,8 +42,10 @@ type Options struct {
 
 func newOptions(opt ...Option) Options {
 	opts := Options{
-		Codecs:   make(map[string]codec.NewCodec),
-		Metadata: map[string]string{},
+		Codecs:           make(map[string]codec.NewCodec),
+		Metadata:         map[string]string{},
+		RegisterInterval: DefaultRegisterInterval,
+		RegisterTTL:      DefaultRegisterTTL,
 	}
 
 	for _, o := range opt {
@@ -58,8 +64,8 @@ func newOptions(opt ...Option) Options {
 		opts.Transport = transport.DefaultTransport
 	}
 
-	if opts.DebugHandler == nil {
-		opts.DebugHandler = debug.DefaultDebugHandler
+	if opts.RegisterCheck == nil {
+		opts.RegisterCheck = DefaultRegisterCheck
 	}
 
 	if len(opts.Address) == 0 {
@@ -144,13 +150,6 @@ func Transport(t transport.Transport) Option {
 	}
 }
 
-// DebugHandler for this server
-func DebugHandler(d debug.DebugHandler) Option {
-	return func(o *Options) {
-		o.DebugHandler = d
-	}
-}
-
 // Metadata associated with the server
 func Metadata(md map[string]string) Option {
 	return func(o *Options) {
@@ -158,10 +157,47 @@ func Metadata(md map[string]string) Option {
 	}
 }
 
+// RegisterCheck run func before registry service
+func RegisterCheck(fn func(context.Context) error) Option {
+	return func(o *Options) {
+		o.RegisterCheck = fn
+	}
+}
+
 // Register the service with a TTL
 func RegisterTTL(t time.Duration) Option {
 	return func(o *Options) {
 		o.RegisterTTL = t
+	}
+}
+
+// Register the service with at interval
+func RegisterInterval(t time.Duration) Option {
+	return func(o *Options) {
+		o.RegisterInterval = t
+	}
+}
+
+// WithRouter sets the request router
+func WithRouter(r Router) Option {
+	return func(o *Options) {
+		o.Router = r
+	}
+}
+
+// Wait tells the server to wait for requests to finish before exiting
+// If `wg` is nil, server only wait for completion of rpc handler.
+// For user need finer grained control, pass a concrete `wg` here, server will
+// wait against it on stop.
+func Wait(wg *sync.WaitGroup) Option {
+	return func(o *Options) {
+		if o.Context == nil {
+			o.Context = context.Background()
+		}
+		if wg == nil {
+			wg = new(sync.WaitGroup)
+		}
+		o.Context = context.WithValue(o.Context, "wait", wg)
 	}
 }
 

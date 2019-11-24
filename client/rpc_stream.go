@@ -1,34 +1,38 @@
 package client
 
 import (
-	"errors"
+	"context"
 	"io"
 	"sync"
 
-	"golang.org/x/net/context"
+	"github.com/micro/go-micro/codec"
 )
 
 // Implements the streamer interface
 type rpcStream struct {
 	sync.RWMutex
-	seq     uint64
-	once    sync.Once
-	closed  chan bool
-	err     error
-	request Request
-	codec   clientCodec
-	context context.Context
+	id       string
+	closed   chan bool
+	err      error
+	request  Request
+	response Response
+	codec    codec.Codec
+	context  context.Context
+
+	// signal whether we should send EOS
+	sendEOS bool
+
+	// release releases the connection back to the pool
+	release func(err error)
 }
 
 func (r *rpcStream) isClosed() bool {
 	select {
-	case _, ok := <-r.closed:
-		if !ok {
-			return true
-		}
+	case <-r.closed:
+		return true
 	default:
+		return false
 	}
-	return false
 }
 
 func (r *rpcStream) Context() context.Context {
@@ -37,6 +41,10 @@ func (r *rpcStream) Context() context.Context {
 
 func (r *rpcStream) Request() Request {
 	return r.request
+}
+
+func (r *rpcStream) Response() Response {
+	return r.response
 }
 
 func (r *rpcStream) Send(msg interface{}) error {
@@ -48,19 +56,19 @@ func (r *rpcStream) Send(msg interface{}) error {
 		return errShutdown
 	}
 
-	seq := r.seq
-	r.seq++
-
-	req := request{
-		Service:       r.request.Service(),
-		Seq:           seq,
-		ServiceMethod: r.request.Method(),
+	req := codec.Message{
+		Id:       r.id,
+		Target:   r.request.Service(),
+		Method:   r.request.Method(),
+		Endpoint: r.request.Endpoint(),
+		Type:     codec.Request,
 	}
 
-	if err := r.codec.WriteRequest(&req, msg); err != nil {
+	if err := r.codec.Write(&req, msg); err != nil {
 		r.err = err
 		return err
 	}
+
 	return nil
 }
 
@@ -73,8 +81,9 @@ func (r *rpcStream) Recv(msg interface{}) error {
 		return errShutdown
 	}
 
-	var resp response
-	if err := r.codec.ReadResponseHeader(&resp); err != nil {
+	var resp codec.Message
+
+	if err := r.codec.ReadHeader(&resp, codec.Response); err != nil {
 		if err == io.EOF && !r.isClosed() {
 			r.err = io.ErrUnexpectedEOF
 			return io.ErrUnexpectedEOF
@@ -93,12 +102,12 @@ func (r *rpcStream) Recv(msg interface{}) error {
 		} else {
 			r.err = io.EOF
 		}
-		if err := r.codec.ReadResponseBody(nil); err != nil {
-			r.err = errors.New("reading error payload: " + err.Error())
+		if err := r.codec.ReadBody(nil); err != nil {
+			r.err = err
 		}
 	default:
-		if err := r.codec.ReadResponseBody(msg); err != nil {
-			r.err = errors.New("reading body " + err.Error())
+		if err := r.codec.ReadBody(msg); err != nil {
+			r.err = err
 		}
 	}
 
@@ -112,8 +121,31 @@ func (r *rpcStream) Error() error {
 }
 
 func (r *rpcStream) Close() error {
-	r.once.Do(func() {
+	select {
+	case <-r.closed:
+		return nil
+	default:
 		close(r.closed)
-	})
-	return r.codec.Close()
+
+		// send the end of stream message
+		if r.sendEOS {
+			// no need to check for error
+			r.codec.Write(&codec.Message{
+				Id:       r.id,
+				Target:   r.request.Service(),
+				Method:   r.request.Method(),
+				Endpoint: r.request.Endpoint(),
+				Type:     codec.Error,
+				Error:    lastStreamResponseError,
+			}, nil)
+		}
+
+		err := r.codec.Close()
+
+		// release the connection
+		r.release(r.Error())
+
+		// return the codec error
+		return err
+	}
 }

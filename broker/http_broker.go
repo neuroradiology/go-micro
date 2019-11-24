@@ -2,39 +2,38 @@ package broker
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/micro/go-micro/errors"
+	"github.com/google/uuid"
+	"github.com/micro/go-micro/codec/json"
+	merr "github.com/micro/go-micro/errors"
 	"github.com/micro/go-micro/registry"
-	mls "github.com/micro/misc/lib/tls"
-	"github.com/pborman/uuid"
-
-	"golang.org/x/net/context"
+	"github.com/micro/go-micro/registry/cache"
+	maddr "github.com/micro/go-micro/util/addr"
+	mnet "github.com/micro/go-micro/util/net"
+	mls "github.com/micro/go-micro/util/tls"
+	"golang.org/x/net/http2"
 )
 
-// HTTP Broker is a placeholder for actual message brokers.
-// This should not really be used in production but useful
-// in developer where you want zero dependencies.
-
+// HTTP Broker is a point to point async broker
 type httpBroker struct {
-	id          string
-	address     string
-	unsubscribe chan *httpSubscriber
-	opts        Options
+	id      string
+	address string
+	opts    Options
+
+	mux *http.ServeMux
 
 	c *http.Client
 	r registry.Registry
@@ -43,18 +42,22 @@ type httpBroker struct {
 	subscribers map[string][]*httpSubscriber
 	running     bool
 	exit        chan chan error
+
+	// offline message inbox
+	mtx   sync.RWMutex
+	inbox map[string][][]byte
 }
 
 type httpSubscriber struct {
 	opts  SubscribeOptions
 	id    string
 	topic string
-	ch    chan *httpSubscriber
 	fn    Handler
 	svc   *registry.Service
+	hb    *httpBroker
 }
 
-type httpPublication struct {
+type httpEvent struct {
 	m *Message
 	t string
 }
@@ -77,6 +80,10 @@ func newTransport(config *tls.Config) *http.Transport {
 		}
 	}
 
+	dialTLS := func(network string, addr string) (net.Conn, error) {
+		return tls.Dial(network, addr, config)
+	}
+
 	t := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		Dial: (&net.Dialer{
@@ -84,16 +91,21 @@ func newTransport(config *tls.Config) *http.Transport {
 			KeepAlive: 30 * time.Second,
 		}).Dial,
 		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:     config,
+		DialTLS:             dialTLS,
 	}
 	runtime.SetFinalizer(&t, func(tr **http.Transport) {
 		(*tr).CloseIdleConnections()
 	})
+
+	// setup http2
+	http2.ConfigureTransport(t)
+
 	return t
 }
 
 func newHttpBroker(opts ...Option) Broker {
 	options := Options{
+		Codec:   json.Marshaler{},
 		Context: context.TODO(),
 	}
 
@@ -101,37 +113,55 @@ func newHttpBroker(opts ...Option) Broker {
 		o(&options)
 	}
 
+	// set address
 	addr := ":0"
 	if len(options.Addrs) > 0 && len(options.Addrs[0]) > 0 {
 		addr = options.Addrs[0]
 	}
 
+	// get registry
 	reg, ok := options.Context.Value(registryKey).(registry.Registry)
 	if !ok {
 		reg = registry.DefaultRegistry
 	}
 
-	return &httpBroker{
-		id:          "broker-" + uuid.NewUUID().String(),
+	h := &httpBroker{
+		id:          "broker-" + uuid.New().String(),
 		address:     addr,
 		opts:        options,
 		r:           reg,
 		c:           &http.Client{Transport: newTransport(options.TLSConfig)},
 		subscribers: make(map[string][]*httpSubscriber),
-		unsubscribe: make(chan *httpSubscriber),
 		exit:        make(chan chan error),
+		mux:         http.NewServeMux(),
+		inbox:       make(map[string][][]byte),
 	}
+
+	// specify the message handler
+	h.mux.Handle(DefaultSubPath, h)
+
+	// get optional handlers
+	if h.opts.Context != nil {
+		handlers, ok := h.opts.Context.Value("http_handlers").(map[string]http.Handler)
+		if ok {
+			for pattern, handler := range handlers {
+				h.mux.Handle(pattern, handler)
+			}
+		}
+	}
+
+	return h
 }
 
-func (h *httpPublication) Ack() error {
+func (h *httpEvent) Ack() error {
 	return nil
 }
 
-func (h *httpPublication) Message() *Message {
+func (h *httpEvent) Message() *Message {
 	return h.m
 }
 
-func (h *httpPublication) Topic() string {
+func (h *httpEvent) Topic() string {
 	return h.t
 }
 
@@ -144,9 +174,84 @@ func (h *httpSubscriber) Topic() string {
 }
 
 func (h *httpSubscriber) Unsubscribe() error {
-	h.ch <- h
-	// artificial delay
-	time.Sleep(time.Millisecond * 10)
+	return h.hb.unsubscribe(h)
+}
+
+func (h *httpBroker) saveMessage(topic string, msg []byte) {
+	h.mtx.Lock()
+	defer h.mtx.Unlock()
+
+	// get messages
+	c := h.inbox[topic]
+
+	// save message
+	c = append(c, msg)
+
+	// max length 64
+	if len(c) > 64 {
+		c = c[:64]
+	}
+
+	// save inbox
+	h.inbox[topic] = c
+}
+
+func (h *httpBroker) getMessage(topic string, num int) [][]byte {
+	h.mtx.Lock()
+	defer h.mtx.Unlock()
+
+	// get messages
+	c, ok := h.inbox[topic]
+	if !ok {
+		return nil
+	}
+
+	// more message than requests
+	if len(c) >= num {
+		msg := c[:num]
+		h.inbox[topic] = c[num:]
+		return msg
+	}
+
+	// reset inbox
+	h.inbox[topic] = nil
+
+	// return all messages
+	return c
+}
+
+func (h *httpBroker) subscribe(s *httpSubscriber) error {
+	h.Lock()
+	defer h.Unlock()
+
+	if err := h.r.Register(s.svc, registry.RegisterTTL(registerTTL)); err != nil {
+		return err
+	}
+
+	h.subscribers[s.topic] = append(h.subscribers[s.topic], s)
+	return nil
+}
+
+func (h *httpBroker) unsubscribe(s *httpSubscriber) error {
+	h.Lock()
+	defer h.Unlock()
+
+	var subscribers []*httpSubscriber
+
+	// look for subscriber
+	for _, sub := range h.subscribers[s.topic] {
+		// deregister and skip forward
+		if sub.id == s.id {
+			_ = h.r.Deregister(sub.svc)
+			continue
+		}
+		// keep subscriber
+		subscribers = append(subscribers, sub)
+	}
+
+	// set subscribers
+	h.subscribers[s.topic] = subscribers
+
 	return nil
 }
 
@@ -161,90 +266,28 @@ func (h *httpBroker) run(l net.Listener) {
 			h.RLock()
 			for _, subs := range h.subscribers {
 				for _, sub := range subs {
-					h.r.Register(sub.svc, registry.RegisterTTL(registerTTL))
+					_ = h.r.Register(sub.svc, registry.RegisterTTL(registerTTL))
 				}
 			}
 			h.RUnlock()
 		// received exit signal
 		case ch := <-h.exit:
 			ch <- l.Close()
-			h.Lock()
-			h.running = false
-			h.Unlock()
-			return
-		// unsubscribe subscriber
-		case subscriber := <-h.unsubscribe:
-			h.Lock()
-			var subscribers []*httpSubscriber
-			for _, sub := range h.subscribers[subscriber.topic] {
-				if sub.id == subscriber.id {
-					h.r.Deregister(sub.svc)
+			h.RLock()
+			for _, subs := range h.subscribers {
+				for _, sub := range subs {
+					_ = h.r.Deregister(sub.svc)
 				}
-				subscribers = append(subscribers, sub)
 			}
-			h.subscribers[subscriber.topic] = subscribers
-			h.Unlock()
+			h.RUnlock()
+			return
 		}
 	}
-}
-
-func (h *httpBroker) start() error {
-	h.Lock()
-	defer h.Unlock()
-
-	if h.running {
-		return nil
-	}
-
-	var l net.Listener
-	var err error
-
-	if h.opts.Secure || h.opts.TLSConfig != nil {
-		config := h.opts.TLSConfig
-		if config == nil {
-			cert, err := mls.Certificate(h.address)
-			if err != nil {
-				return err
-			}
-			config = &tls.Config{Certificates: []tls.Certificate{cert}}
-		}
-		l, err = tls.Listen("tcp", h.address, config)
-	} else {
-		l, err = net.Listen("tcp", h.address)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Broker Listening on %s", l.Addr().String())
-	h.address = l.Addr().String()
-
-	go http.Serve(l, h)
-	go h.run(l)
-
-	h.running = true
-	return nil
-}
-
-func (h *httpBroker) stop() error {
-	h.Lock()
-	defer h.Unlock()
-
-	if !h.running {
-		return nil
-	}
-
-	ch := make(chan error)
-	h.exit <- ch
-	err := <-ch
-	h.running = false
-	return err
 }
 
 func (h *httpBroker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "POST" {
-		err := errors.BadRequest("go.micro.broker", "Method not allowed")
+		err := merr.BadRequest("go.micro.broker", "Method not allowed")
 		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
 		return
 	}
@@ -254,15 +297,15 @@ func (h *httpBroker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	b, err := ioutil.ReadAll(req.Body)
 	if err != nil {
-		errr := errors.InternalServerError("go.micro.broker", fmt.Sprintf("Error reading request body: %v", err))
+		errr := merr.InternalServerError("go.micro.broker", "Error reading request body: %v", err)
 		w.WriteHeader(500)
 		w.Write([]byte(errr.Error()))
 		return
 	}
 
 	var m *Message
-	if err = json.Unmarshal(b, &m); err != nil {
-		errr := errors.InternalServerError("go.micro.broker", fmt.Sprintf("Error parsing request body: %v", err))
+	if err = h.opts.Codec.Unmarshal(b, &m); err != nil {
+		errr := merr.InternalServerError("go.micro.broker", "Error parsing request body: %v", err)
 		w.WriteHeader(500)
 		w.Write([]byte(errr.Error()))
 		return
@@ -272,53 +315,187 @@ func (h *httpBroker) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	delete(m.Header, ":topic")
 
 	if len(topic) == 0 {
-		errr := errors.InternalServerError("go.micro.broker", "Topic not found")
+		errr := merr.InternalServerError("go.micro.broker", "Topic not found")
 		w.WriteHeader(500)
 		w.Write([]byte(errr.Error()))
 		return
 	}
 
-	p := &httpPublication{m: m, t: topic}
+	p := &httpEvent{m: m, t: topic}
 	id := req.Form.Get("id")
+
+	var subs []Handler
 
 	h.RLock()
 	for _, subscriber := range h.subscribers[topic] {
-		if id == subscriber.id {
-			subscriber.fn(p)
+		if id != subscriber.id {
+			continue
 		}
+		subs = append(subs, subscriber.fn)
 	}
 	h.RUnlock()
+
+	// execute the handler
+	for _, fn := range subs {
+		fn(p)
+	}
 }
 
 func (h *httpBroker) Address() string {
+	h.RLock()
+	defer h.RUnlock()
 	return h.address
 }
 
 func (h *httpBroker) Connect() error {
-	return h.start()
+	h.RLock()
+	if h.running {
+		h.RUnlock()
+		return nil
+	}
+	h.RUnlock()
+
+	h.Lock()
+	defer h.Unlock()
+
+	var l net.Listener
+	var err error
+
+	if h.opts.Secure || h.opts.TLSConfig != nil {
+		config := h.opts.TLSConfig
+
+		fn := func(addr string) (net.Listener, error) {
+			if config == nil {
+				hosts := []string{addr}
+
+				// check if its a valid host:port
+				if host, _, err := net.SplitHostPort(addr); err == nil {
+					if len(host) == 0 {
+						hosts = maddr.IPs()
+					} else {
+						hosts = []string{host}
+					}
+				}
+
+				// generate a certificate
+				cert, err := mls.Certificate(hosts...)
+				if err != nil {
+					return nil, err
+				}
+				config = &tls.Config{Certificates: []tls.Certificate{cert}}
+			}
+			return tls.Listen("tcp", addr, config)
+		}
+
+		l, err = mnet.Listen(h.address, fn)
+	} else {
+		fn := func(addr string) (net.Listener, error) {
+			return net.Listen("tcp", addr)
+		}
+
+		l, err = mnet.Listen(h.address, fn)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	addr := h.address
+	h.address = l.Addr().String()
+
+	go http.Serve(l, h.mux)
+	go func() {
+		h.run(l)
+		h.Lock()
+		h.opts.Addrs = []string{addr}
+		h.address = addr
+		h.Unlock()
+	}()
+
+	// get registry
+	reg, ok := h.opts.Context.Value(registryKey).(registry.Registry)
+	if !ok {
+		reg = registry.DefaultRegistry
+	}
+	// set cache
+	h.r = cache.New(reg)
+
+	// set running
+	h.running = true
+	return nil
 }
 
 func (h *httpBroker) Disconnect() error {
-	return h.stop()
+	h.RLock()
+	if !h.running {
+		h.RUnlock()
+		return nil
+	}
+	h.RUnlock()
+
+	h.Lock()
+	defer h.Unlock()
+
+	// stop cache
+	rc, ok := h.r.(cache.Cache)
+	if ok {
+		rc.Stop()
+	}
+
+	// exit and return err
+	ch := make(chan error)
+	h.exit <- ch
+	err := <-ch
+
+	// set not running
+	h.running = false
+	return err
 }
 
 func (h *httpBroker) Init(opts ...Option) error {
+	h.RLock()
+	if h.running {
+		h.RUnlock()
+		return errors.New("cannot init while connected")
+	}
+	h.RUnlock()
+
+	h.Lock()
+	defer h.Unlock()
+
 	for _, o := range opts {
 		o(&h.opts)
 	}
 
-	if len(h.id) == 0 {
-		h.id = "broker-" + uuid.NewUUID().String()
+	if len(h.opts.Addrs) > 0 && len(h.opts.Addrs[0]) > 0 {
+		h.address = h.opts.Addrs[0]
 	}
 
+	if len(h.id) == 0 {
+		h.id = "broker-" + uuid.New().String()
+	}
+
+	// get registry
 	reg, ok := h.opts.Context.Value(registryKey).(registry.Registry)
 	if !ok {
 		reg = registry.DefaultRegistry
 	}
 
-	h.r = reg
+	// get cache
+	if rc, ok := h.r.(cache.Cache); ok {
+		rc.Stop()
+	}
 
-	http.Handle(DefaultSubPath, h)
+	// set registry
+	h.r = cache.New(reg)
+
+	// reconfigure tls config
+	if c := h.opts.TLSConfig; c != nil {
+		h.c = &http.Client{
+			Transport: newTransport(c),
+		}
+	}
+
 	return nil
 }
 
@@ -327,22 +504,38 @@ func (h *httpBroker) Options() Options {
 }
 
 func (h *httpBroker) Publish(topic string, msg *Message, opts ...PublishOption) error {
-	s, err := h.r.GetService("topic:" + topic)
+	// create the message first
+	m := &Message{
+		Header: make(map[string]string),
+		Body:   msg.Body,
+	}
+
+	for k, v := range msg.Header {
+		m.Header[k] = v
+	}
+
+	m.Header[":topic"] = topic
+
+	// encode the message
+	b, err := h.opts.Codec.Marshal(m)
 	if err != nil {
 		return err
 	}
 
-	if msg.Header == nil {
-		msg.Header = map[string]string{}
-	}
+	// save the message
+	h.saveMessage(topic, b)
 
-	msg.Header[":topic"] = topic
-	b, err := json.Marshal(msg)
+	// now attempt to get the service
+	h.RLock()
+	s, err := h.r.GetService(topic)
 	if err != nil {
-		return err
+		h.RUnlock()
+		// ignore error
+		return nil
 	}
+	h.RUnlock()
 
-	fn := func(node *registry.Node, b io.Reader) {
+	pub := func(node *registry.Node, t string, b []byte) error {
 		scheme := "http"
 
 		// check if secure is added in metadata
@@ -352,53 +545,111 @@ func (h *httpBroker) Publish(topic string, msg *Message, opts ...PublishOption) 
 
 		vals := url.Values{}
 		vals.Add("id", node.Id)
-		uri := fmt.Sprintf("%s://%s:%d%s?%s", scheme, node.Address, node.Port, DefaultSubPath, vals.Encode())
-		r, err := h.c.Post(uri, "application/json", b)
-		if err == nil {
-			r.Body.Close()
-		}
-	}
 
-	buf := bytes.NewBuffer(nil)
-
-	for _, service := range s {
-		// broadcast version means broadcast to all nodes
-		if service.Version == broadcastVersion {
-			for _, node := range service.Nodes {
-				buf.Reset()
-				buf.Write(b)
-				fn(node, buf)
-			}
-			return nil
+		uri := fmt.Sprintf("%s://%s%s?%s", scheme, node.Address, DefaultSubPath, vals.Encode())
+		r, err := h.c.Post(uri, "application/json", bytes.NewReader(b))
+		if err != nil {
+			return err
 		}
 
-		node := service.Nodes[rand.Int()%len(service.Nodes)]
-		buf.Reset()
-		buf.Write(b)
-		fn(node, buf)
+		// discard response body
+		io.Copy(ioutil.Discard, r.Body)
+		r.Body.Close()
 		return nil
 	}
 
-	buf.Reset()
-	buf = nil
+	srv := func(s []*registry.Service, b []byte) {
+		for _, service := range s {
+			var nodes []*registry.Node
+
+			for _, node := range service.Nodes {
+				// only use nodes tagged with broker http
+				if node.Metadata["broker"] != "http" {
+					continue
+				}
+
+				// look for nodes for the topic
+				if node.Metadata["topic"] != topic {
+					continue
+				}
+
+				nodes = append(nodes, node)
+			}
+
+			// only process if we have nodes
+			if len(nodes) == 0 {
+				continue
+			}
+
+			switch service.Version {
+			// broadcast version means broadcast to all nodes
+			case broadcastVersion:
+				var success bool
+
+				// publish to all nodes
+				for _, node := range nodes {
+					// publish async
+					if err := pub(node, topic, b); err == nil {
+						success = true
+					}
+				}
+
+				// save if it failed to publish at least once
+				if !success {
+					h.saveMessage(topic, b)
+				}
+			default:
+				// select node to publish to
+				node := nodes[rand.Int()%len(nodes)]
+
+				// publish async to one node
+				if err := pub(node, topic, b); err != nil {
+					// if failed save it
+					h.saveMessage(topic, b)
+				}
+			}
+		}
+	}
+
+	// do the rest async
+	go func() {
+		// get a third of the backlog
+		messages := h.getMessage(topic, 8)
+		delay := (len(messages) > 1)
+
+		// publish all the messages
+		for _, msg := range messages {
+			// serialize here
+			srv(s, msg)
+
+			// sending a backlog of messages
+			if delay {
+				time.Sleep(time.Millisecond * 100)
+			}
+		}
+	}()
 
 	return nil
 }
 
 func (h *httpBroker) Subscribe(topic string, handler Handler, opts ...SubscribeOption) (Subscriber, error) {
-	opt := newSubscribeOptions(opts...)
+	var err error
+	var host, port string
+	options := NewSubscribeOptions(opts...)
 
 	// parse address for host, port
-	parts := strings.Split(h.Address(), ":")
-	host := strings.Join(parts[:len(parts)-1], ":")
-	port, _ := strconv.Atoi(parts[len(parts)-1])
-
-	addr, err := extractAddress(host)
+	host, port, err = net.SplitHostPort(h.Address())
 	if err != nil {
 		return nil, err
 	}
 
-	id := uuid.NewUUID().String()
+	addr, err := maddr.Extract(host)
+	if err != nil {
+		return nil, err
+	}
+
+	// create unique id
+	id := h.id + "." + uuid.New().String()
 
 	var secure bool
 
@@ -408,41 +659,43 @@ func (h *httpBroker) Subscribe(topic string, handler Handler, opts ...SubscribeO
 
 	// register service
 	node := &registry.Node{
-		Id:      h.id + "." + id,
-		Address: addr,
-		Port:    port,
+		Id:      id,
+		Address: mnet.HostPort(addr, port),
 		Metadata: map[string]string{
 			"secure": fmt.Sprintf("%t", secure),
+			"broker": "http",
+			"topic":  topic,
 		},
 	}
 
-	version := opt.Queue
+	// check for queue group or broadcast queue
+	version := options.Queue
 	if len(version) == 0 {
 		version = broadcastVersion
 	}
 
 	service := &registry.Service{
-		Name:    "topic:" + topic,
+		Name:    topic,
 		Version: version,
 		Nodes:   []*registry.Node{node},
 	}
 
+	// generate subscriber
 	subscriber := &httpSubscriber{
-		opts:  opt,
-		id:    h.id + "." + id,
+		opts:  options,
+		hb:    h,
+		id:    id,
 		topic: topic,
-		ch:    h.unsubscribe,
 		fn:    handler,
 		svc:   service,
 	}
 
-	if err := h.r.Register(service, registry.RegisterTTL(registerTTL)); err != nil {
+	// subscribe now
+	if err := h.subscribe(subscriber); err != nil {
 		return nil, err
 	}
 
-	h.Lock()
-	h.subscribers[topic] = append(h.subscribers[topic], subscriber)
-	h.Unlock()
+	// return the subscriber
 	return subscriber, nil
 }
 

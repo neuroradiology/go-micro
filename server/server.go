@@ -1,43 +1,20 @@
-/*
-Server represents a server instance in go-micro which handles synchronous
-requests via handlers and asynchronous requests via subscribers that
-register with a broker.
-
-The server combines the all the packages in go-micro to create a whole unit
-used for building applications including discovery, client/server communication
-and pub/sub.
-
-	import "github.com/micro/go-micro/server"
-
-	type Greeter struct {}
-
-	func (g *Greeter) Hello(ctx context.Context, req *greeter.Request, rsp *greeter.Response) error {
-		rsp.Msg = "Hello " + req.Name
-		return nil
-	}
-
-	s := server.NewServer()
-
-
-	s.Handle(
-		s.NewHandler(&Greeter{}),
-	)
-
-	s.Start()
-
-*/
+// Package server is an interface for a micro server
 package server
 
 import (
-	"log"
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/pborman/uuid"
-	"golang.org/x/net/context"
+	"github.com/google/uuid"
+	"github.com/micro/go-micro/codec"
+	"github.com/micro/go-micro/registry"
+	log "github.com/micro/go-micro/util/log"
 )
 
+// Server is a simple micro server abstraction
 type Server interface {
 	Options() Options
 	Init(...Option) error
@@ -45,33 +22,61 @@ type Server interface {
 	NewHandler(interface{}, ...HandlerOption) Handler
 	NewSubscriber(string, interface{}, ...SubscriberOption) Subscriber
 	Subscribe(Subscriber) error
-	Register() error
-	Deregister() error
 	Start() error
 	Stop() error
 	String() string
 }
 
-type Publication interface {
+// Router handle serving messages
+type Router interface {
+	// ServeRequest processes a request to completion
+	ServeRequest(context.Context, Request, Response) error
+}
+
+// Message is an async message interface
+type Message interface {
 	Topic() string
-	Message() interface{}
+	Payload() interface{}
 	ContentType() string
 }
 
+// Request is a synchronous request interface
 type Request interface {
+	// Service name requested
 	Service() string
+	// The action requested
 	Method() string
+	// Endpoint name requested
+	Endpoint() string
+	// Content type provided
 	ContentType() string
-	Request() interface{}
-	// indicates whether the request will be streamed
+	// Header of the request
+	Header() map[string]string
+	// Body is the initial decoded value
+	Body() interface{}
+	// Read the undecoded request body
+	Read() ([]byte, error)
+	// The encoded message stream
+	Codec() codec.Reader
+	// Indicates whether its a stream
 	Stream() bool
 }
 
-// Streamer represents a stream established with a client.
+// Response is the response writer for unencoded messages
+type Response interface {
+	// Encoded writer
+	Codec() codec.Writer
+	// Write the header
+	WriteHeader(map[string]string)
+	// write a response directly to the client
+	Write([]byte) error
+}
+
+// Stream represents a stream established with a client.
 // A stream can be bidirectional which is indicated by the request.
 // The last error will be left in Error().
-// EOF indicated end of the stream.
-type Streamer interface {
+// EOF indicates end of the stream.
+type Stream interface {
 	Context() context.Context
 	Request() Request
 	Send(interface{}) error
@@ -80,26 +85,54 @@ type Streamer interface {
 	Close() error
 }
 
+// Handler interface represents a request handler. It's generated
+// by passing any type of public concrete object with endpoints into server.NewHandler.
+// Most will pass in a struct.
+//
+// Example:
+//
+//      type Greeter struct {}
+//
+//      func (g *Greeter) Hello(context, request, response) error {
+//              return nil
+//      }
+//
+type Handler interface {
+	Name() string
+	Handler() interface{}
+	Endpoints() []*registry.Endpoint
+	Options() HandlerOptions
+}
+
+// Subscriber interface represents a subscription to a given topic using
+// a specific subscriber function or object with endpoints.
+type Subscriber interface {
+	Topic() string
+	Subscriber() interface{}
+	Endpoints() []*registry.Endpoint
+	Options() SubscriberOptions
+}
+
 type Option func(*Options)
 
-type HandlerOption func(*HandlerOptions)
-
-type SubscriberOption func(*SubscriberOptions)
-
 var (
-	DefaultAddress        = ":0"
-	DefaultName           = "go-server"
-	DefaultVersion        = "1.0.0"
-	DefaultId             = uuid.NewUUID().String()
-	DefaultServer  Server = newRpcServer()
+	DefaultAddress                 = ":0"
+	DefaultName                    = "go.micro.server"
+	DefaultVersion                 = time.Now().Format("2006.01.02.15.04")
+	DefaultId                      = uuid.New().String()
+	DefaultServer           Server = newRpcServer()
+	DefaultRouter                  = newRpcRouter()
+	DefaultRegisterCheck           = func(context.Context) error { return nil }
+	DefaultRegisterInterval        = time.Second * 30
+	DefaultRegisterTTL             = time.Minute
 )
 
-// Returns config options for the default service
+// DefaultOptions returns config options for the default service
 func DefaultOptions() Options {
 	return DefaultServer.Options()
 }
 
-// Initialises the default server with options passed in
+// Init initialises the default server with options passed in
 func Init(opt ...Option) {
 	if DefaultServer == nil {
 		DefaultServer = newRpcServer(opt...)
@@ -107,20 +140,25 @@ func Init(opt ...Option) {
 	DefaultServer.Init(opt...)
 }
 
-// Returns a new server with options passed in
+// NewServer returns a new server with options passed in
 func NewServer(opt ...Option) Server {
 	return newRpcServer(opt...)
 }
 
-// Creates a new subscriber interface with the given topic
+// NewRouter returns a new router
+func NewRouter() *router {
+	return newRpcRouter()
+}
+
+// NewSubscriber creates a new subscriber interface with the given topic
 // and handler using the default server
 func NewSubscriber(topic string, h interface{}, opts ...SubscriberOption) Subscriber {
 	return DefaultServer.NewSubscriber(topic, h, opts...)
 }
 
-// Creates a new handler interface using the default server
+// NewHandler creates a new handler interface using the default server
 // Handlers are required to be a public object with public
-// methods. Call to a service method such as Foo.Bar expects
+// endpoints. Call to a service endpoint such as Foo.Bar expects
 // the type:
 //
 //	type Foo struct {}
@@ -132,63 +170,46 @@ func NewHandler(h interface{}, opts ...HandlerOption) Handler {
 	return DefaultServer.NewHandler(h, opts...)
 }
 
-// Registers a handler interface with the default server to
+// Handle registers a handler interface with the default server to
 // handle inbound requests
 func Handle(h Handler) error {
 	return DefaultServer.Handle(h)
 }
 
-// Registers a subscriber interface with the default server
+// Subscribe registers a subscriber interface with the default server
 // which subscribes to specified topic with the broker
 func Subscribe(s Subscriber) error {
 	return DefaultServer.Subscribe(s)
 }
 
-// Registers the default server with the discovery system
-func Register() error {
-	return DefaultServer.Register()
-}
-
-// Deregisters the default server from the discovery system
-func Deregister() error {
-	return DefaultServer.Deregister()
-}
-
-// Blocking run starts the default server and waits for a kill
+// Run starts the default server and waits for a kill
 // signal before exiting. Also registers/deregisters the server
 func Run() error {
 	if err := Start(); err != nil {
 		return err
 	}
 
-	if err := DefaultServer.Register(); err != nil {
-		return err
-	}
-
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGKILL)
-	log.Printf("Received signal %s", <-ch)
-
-	if err := DefaultServer.Deregister(); err != nil {
-		return err
-	}
+	log.Logf("Received signal %s", <-ch)
 
 	return Stop()
 }
 
-// Starts the default server
+// Start starts the default server
 func Start() error {
 	config := DefaultServer.Options()
-	log.Printf("Starting server %s id %s", config.Name, config.Id)
+	log.Logf("Starting server %s id %s", config.Name, config.Id)
 	return DefaultServer.Start()
 }
 
-// Stops the default server
+// Stop stops the default server
 func Stop() error {
-	log.Printf("Stopping server")
+	log.Logf("Stopping server")
 	return DefaultServer.Stop()
 }
 
+// String returns name of Server implementation
 func String() string {
 	return DefaultServer.String()
 }

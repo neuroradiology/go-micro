@@ -2,23 +2,11 @@ package server
 
 import (
 	"fmt"
-	"net"
 	"reflect"
+	"strings"
 
 	"github.com/micro/go-micro/registry"
 )
-
-var (
-	privateBlocks []*net.IPNet
-)
-
-func init() {
-	for _, b := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
-		if _, block, err := net.ParseCIDR(b); err == nil {
-			privateBlocks = append(privateBlocks, block)
-		}
-	}
-}
 
 func extractValue(v reflect.Type, d int) *registry.Value {
 	if d == 3 {
@@ -40,11 +28,31 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 	switch v.Kind() {
 	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
-			val := extractValue(v.Field(i).Type, d+1)
+			f := v.Field(i)
+			val := extractValue(f.Type, d+1)
 			if val == nil {
 				continue
 			}
-			val.Name = v.Field(i).Name
+
+			// if we can find a json tag use it
+			if tags := f.Tag.Get("json"); len(tags) > 0 {
+				parts := strings.Split(tags, ",")
+				if parts[0] == "-" || parts[0] == "omitempty" {
+					continue
+				}
+				val.Name = parts[0]
+			}
+
+			// if there's no name default it
+			if len(val.Name) == 0 {
+				val.Name = v.Field(i).Name
+			}
+
+			// still no name then continue
+			if len(val.Name) == 0 {
+				continue
+			}
+
 			arg.Values = append(arg.Values, val)
 		}
 	case reflect.Slice:
@@ -53,10 +61,6 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 			p = p.Elem()
 		}
 		arg.Type = "[]" + p.Name()
-		val := extractValue(v.Elem(), d+1)
-		if val != nil {
-			arg.Values = append(arg.Values, val)
-		}
 	}
 
 	return arg
@@ -82,21 +86,30 @@ func extractEndpoint(method reflect.Method) *registry.Endpoint {
 		return nil
 	}
 
-	if rspType.Kind() == reflect.Func {
+	// are we dealing with a stream?
+	switch rspType.Kind() {
+	case reflect.Func, reflect.Interface:
 		stream = true
 	}
 
 	request := extractValue(reqType, 0)
 	response := extractValue(rspType, 0)
 
-	return &registry.Endpoint{
+	ep := &registry.Endpoint{
 		Name:     method.Name,
 		Request:  request,
 		Response: response,
-		Metadata: map[string]string{
-			"stream": fmt.Sprintf("%v", stream),
-		},
+		Metadata: make(map[string]string),
 	}
+
+	// set endpoint metadata for stream
+	if stream {
+		ep.Metadata = map[string]string{
+			"stream": fmt.Sprintf("%v", stream),
+		}
+	}
+
+	return ep
 }
 
 func extractSubValue(typ reflect.Type) *registry.Value {
@@ -112,56 +125,4 @@ func extractSubValue(typ reflect.Type) *registry.Value {
 		return nil
 	}
 	return extractValue(reqType, 0)
-}
-
-func extractAddress(addr string) (string, error) {
-	if len(addr) > 0 && (addr != "0.0.0.0" && addr != "[::]") {
-		return addr, nil
-	}
-
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "", fmt.Errorf("Failed to get interface addresses! Err: %v", err)
-	}
-
-	var ipAddr []byte
-
-	for _, rawAddr := range addrs {
-		var ip net.IP
-		switch addr := rawAddr.(type) {
-		case *net.IPAddr:
-			ip = addr.IP
-		case *net.IPNet:
-			ip = addr.IP
-		default:
-			continue
-		}
-
-		if ip.To4() == nil {
-			continue
-		}
-
-		if !isPrivateIP(ip.String()) {
-			continue
-		}
-
-		ipAddr = ip
-		break
-	}
-
-	if ipAddr == nil {
-		return "", fmt.Errorf("No private IP address found, and explicit IP not provided")
-	}
-
-	return net.IP(ipAddr).String(), nil
-}
-
-func isPrivateIP(ipAddr string) bool {
-	ip := net.ParseIP(ipAddr)
-	for _, priv := range privateBlocks {
-		if priv.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }

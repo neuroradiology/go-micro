@@ -1,20 +1,22 @@
 package server
 
 import (
-	"log"
+	"context"
+	"errors"
+	"io"
 	"sync"
 
-	"golang.org/x/net/context"
+	"github.com/micro/go-micro/codec"
 )
 
 // Implements the Streamer interface
 type rpcStream struct {
 	sync.RWMutex
-	seq     uint64
+	id      string
 	closed  bool
 	err     error
 	request Request
-	codec   serverCodec
+	codec   codec.Codec
 	context context.Context
 }
 
@@ -30,35 +32,53 @@ func (r *rpcStream) Send(msg interface{}) error {
 	r.Lock()
 	defer r.Unlock()
 
-	resp := response{
-		ServiceMethod: r.request.Method(),
-		Seq:           r.seq,
+	resp := codec.Message{
+		Target:   r.request.Service(),
+		Method:   r.request.Method(),
+		Endpoint: r.request.Endpoint(),
+		Id:       r.id,
+		Type:     codec.Response,
 	}
 
-	err := r.codec.WriteResponse(&resp, msg, false)
-	if err != nil {
-		log.Println("rpc: writing response:", err)
+	if err := r.codec.Write(&resp, msg); err != nil {
+		r.err = err
 	}
 
-	return err
+	return nil
 }
 
 func (r *rpcStream) Recv(msg interface{}) error {
 	r.Lock()
 	defer r.Unlock()
 
-	req := request{}
+	req := new(codec.Message)
+	req.Type = codec.Request
 
-	if err := r.codec.ReadRequestHeader(&req, false); err != nil {
+	if err := r.codec.ReadHeader(req, req.Type); err != nil {
 		// discard body
-		r.codec.ReadRequestBody(nil)
+		r.codec.ReadBody(nil)
+		r.err = err
 		return err
 	}
 
-	// we need to stay upto date with sequence numbers
-	r.seq = req.Seq
+	// check the error
+	if len(req.Error) > 0 {
+		// Check the client closed the stream
+		switch req.Error {
+		case lastStreamResponseError.Error():
+			// discard body
+			r.codec.ReadBody(nil)
+			r.err = io.EOF
+			return io.EOF
+		default:
+			return errors.New(req.Error)
+		}
+	}
 
-	if err := r.codec.ReadRequestBody(msg); err != nil {
+	// we need to stay up to date with sequence numbers
+	r.id = req.Id
+	if err := r.codec.ReadBody(msg); err != nil {
+		r.err = err
 		return err
 	}
 

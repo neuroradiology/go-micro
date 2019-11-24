@@ -5,22 +5,21 @@ import (
 	"bytes"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"sync"
+	"time"
 
-	mls "github.com/micro/misc/lib/tls"
+	maddr "github.com/micro/go-micro/util/addr"
+	"github.com/micro/go-micro/util/buf"
+	mnet "github.com/micro/go-micro/util/net"
+	mls "github.com/micro/go-micro/util/tls"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
-
-type buffer struct {
-	io.ReadWriter
-}
 
 type httpTransport struct {
 	opts Options
@@ -33,79 +32,52 @@ type httpTransportClient struct {
 	dialOpts DialOptions
 	once     sync.Once
 
-	sync.Mutex
+	sync.RWMutex
+
+	// request must be stored for response processing
 	r    chan *http.Request
 	bl   []*http.Request
 	buff *bufio.Reader
+
+	// local/remote ip
+	local  string
+	remote string
 }
 
 type httpTransportSocket struct {
-	r    chan *http.Request
-	conn net.Conn
-	once sync.Once
+	ht *httpTransport
+	w  http.ResponseWriter
+	r  *http.Request
+	rw *bufio.ReadWriter
 
-	sync.Mutex
-	buff *bufio.Reader
+	mtx sync.RWMutex
+
+	// the hijacked when using http 1
+	conn net.Conn
+	// for the first request
+	ch chan *http.Request
+
+	// h2 things
+	buf *bufio.Reader
+	// indicate if socket is closed
+	closed chan bool
+
+	// local/remote ip
+	local  string
+	remote string
 }
 
 type httpTransportListener struct {
+	ht       *httpTransport
 	listener net.Listener
 }
 
-func listen(addr string, fn func(string) (net.Listener, error)) (net.Listener, error) {
-	// host:port || host:min-max
-	parts := strings.Split(addr, ":")
-
-	//
-	if len(parts) < 2 {
-		return fn(addr)
-	}
-
-	// try to extract port range
-	ports := strings.Split(parts[len(parts)-1], "-")
-
-	// single port
-	if len(ports) < 2 {
-		return fn(addr)
-	}
-
-	// we have a port range
-
-	// extract min port
-	min, err := strconv.Atoi(ports[0])
-	if err != nil {
-		return nil, errors.New("unable to extract port range")
-	}
-
-	// extract max port
-	max, err := strconv.Atoi(ports[1])
-	if err != nil {
-		return nil, errors.New("unable to extract port range")
-	}
-
-	// set host
-	host := parts[:len(parts)-1]
-
-	// range the ports
-	for port := min; port <= max; port++ {
-		// try bind to host:port
-		ln, err := fn(fmt.Sprintf("%s:%d", host, port))
-		if err == nil {
-			return ln, nil
-		}
-
-		// hit max port
-		if port == max {
-			return nil, err
-		}
-	}
-
-	// why are we here?
-	return nil, fmt.Errorf("unable to bind to %s", addr)
+func (h *httpTransportClient) Local() string {
+	return h.local
 }
 
-func (b *buffer) Close() error {
-	return nil
+func (h *httpTransportClient) Remote() string {
+	return h.remote
 }
 
 func (h *httpTransportClient) Send(m *Message) error {
@@ -115,11 +87,8 @@ func (h *httpTransportClient) Send(m *Message) error {
 		header.Set(k, v)
 	}
 
-	reqB := bytes.NewBuffer(m.Body)
-	defer reqB.Reset()
-	buf := &buffer{
-		reqB,
-	}
+	b := buf.New(bytes.NewBuffer(m.Body))
+	defer b.Close()
 
 	req := &http.Request{
 		Method: "POST",
@@ -128,8 +97,8 @@ func (h *httpTransportClient) Send(m *Message) error {
 			Host:   h.addr,
 		},
 		Header:        header,
-		Body:          buf,
-		ContentLength: int64(reqB.Len()),
+		Body:          b,
+		ContentLength: int64(b.Len()),
 		Host:          h.addr,
 	}
 
@@ -142,10 +111,19 @@ func (h *httpTransportClient) Send(m *Message) error {
 	}
 	h.Unlock()
 
+	// set timeout if its greater than 0
+	if h.ht.opts.Timeout > time.Duration(0) {
+		h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
+	}
+
 	return req.Write(h.conn)
 }
 
 func (h *httpTransportClient) Recv(m *Message) error {
+	if m == nil {
+		return errors.New("message passed in is nil")
+	}
+
 	var r *http.Request
 	if !h.dialOpts.Stream {
 		rc, ok := <-h.r
@@ -155,10 +133,9 @@ func (h *httpTransportClient) Recv(m *Message) error {
 		r = rc
 	}
 
-	h.Lock()
-	defer h.Unlock()
-	if h.buff == nil {
-		return io.EOF
+	// set timeout if its greater than 0
+	if h.ht.opts.Timeout > time.Duration(0) {
+		h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
 	}
 
 	rsp, err := http.ReadResponse(h.buff, r)
@@ -172,33 +149,43 @@ func (h *httpTransportClient) Recv(m *Message) error {
 		return err
 	}
 
-	mr := &Message{
-		Header: make(map[string]string),
-		Body:   b,
+	if rsp.StatusCode != 200 {
+		return errors.New(rsp.Status + ": " + string(b))
+	}
+
+	m.Body = b
+
+	if m.Header == nil {
+		m.Header = make(map[string]string)
 	}
 
 	for k, v := range rsp.Header {
 		if len(v) > 0 {
-			mr.Header[k] = v[0]
+			m.Header[k] = v[0]
 		} else {
-			mr.Header[k] = ""
+			m.Header[k] = ""
 		}
 	}
 
-	*m = *mr
 	return nil
 }
 
 func (h *httpTransportClient) Close() error {
-	err := h.conn.Close()
 	h.once.Do(func() {
 		h.Lock()
 		h.buff.Reset(nil)
-		h.buff = nil
 		h.Unlock()
 		close(h.r)
 	})
-	return err
+	return h.conn.Close()
+}
+
+func (h *httpTransportSocket) Local() string {
+	return h.local
+}
+
+func (h *httpTransportSocket) Remote() string {
+	return h.remote
 }
 
 func (h *httpTransportSocket) Recv(m *Message) error {
@@ -206,98 +193,190 @@ func (h *httpTransportSocket) Recv(m *Message) error {
 		return errors.New("message passed in is nil")
 	}
 
-	r, err := http.ReadRequest(h.buff)
+	if m.Header == nil {
+		m.Header = make(map[string]string)
+	}
+
+	// process http 1
+	if h.r.ProtoMajor == 1 {
+		// set timeout if its greater than 0
+		if h.ht.opts.Timeout > time.Duration(0) {
+			h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
+		}
+
+		var r *http.Request
+
+		select {
+		// get first request
+		case r = <-h.ch:
+		// read next request
+		default:
+			rr, err := http.ReadRequest(h.rw.Reader)
+			if err != nil {
+				return err
+			}
+			r = rr
+		}
+
+		// read body
+		b, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+
+		// set body
+		r.Body.Close()
+		m.Body = b
+
+		// set headers
+		for k, v := range r.Header {
+			if len(v) > 0 {
+				m.Header[k] = v[0]
+			} else {
+				m.Header[k] = ""
+			}
+		}
+
+		// return early early
+		return nil
+	}
+
+	// only process if the socket is open
+	select {
+	case <-h.closed:
+		return io.EOF
+	default:
+		// no op
+	}
+
+	// processing http2 request
+	// read streaming body
+
+	// set max buffer size
+	// TODO: adjustable buffer size
+	buf := make([]byte, 4*1024*1024)
+
+	// read the request body
+	n, err := h.buf.Read(buf)
+	// not an eof error
 	if err != nil {
 		return err
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	r.Body.Close()
-
-	mr := &Message{
-		Header: make(map[string]string),
-		Body:   b,
+	// check if we have data
+	if n > 0 {
+		m.Body = buf[:n]
 	}
 
-	for k, v := range r.Header {
+	// set headers
+	for k, v := range h.r.Header {
 		if len(v) > 0 {
-			mr.Header[k] = v[0]
+			m.Header[k] = v[0]
 		} else {
-			mr.Header[k] = ""
+			m.Header[k] = ""
 		}
 	}
 
-	select {
-	case h.r <- r:
-	default:
-	}
+	// set path
+	m.Header[":path"] = h.r.URL.Path
 
-	*m = *mr
 	return nil
 }
 
 func (h *httpTransportSocket) Send(m *Message) error {
-	b := bytes.NewBuffer(m.Body)
-	defer b.Reset()
+	if h.r.ProtoMajor == 1 {
+		rsp := &http.Response{
+			Header:        h.r.Header,
+			Body:          ioutil.NopCloser(bytes.NewReader(m.Body)),
+			Status:        "200 OK",
+			StatusCode:    200,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			ContentLength: int64(len(m.Body)),
+		}
 
-	r := <-h.r
+		for k, v := range m.Header {
+			rsp.Header.Set(k, v)
+		}
 
-	rsp := &http.Response{
-		Header:        r.Header,
-		Body:          &buffer{b},
-		Status:        "200 OK",
-		StatusCode:    200,
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		ContentLength: int64(len(m.Body)),
+		// set timeout if its greater than 0
+		if h.ht.opts.Timeout > time.Duration(0) {
+			h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout))
+		}
+
+		return rsp.Write(h.conn)
 	}
 
-	for k, v := range m.Header {
-		rsp.Header.Set(k, v)
-	}
-
+	// only process if the socket is open
 	select {
-	case h.r <- r:
+	case <-h.closed:
+		return io.EOF
 	default:
+		// no op
 	}
 
-	return rsp.Write(h.conn)
+	// we need to lock to protect the write
+	h.mtx.RLock()
+	defer h.mtx.RUnlock()
+
+	// set headers
+	for k, v := range m.Header {
+		h.w.Header().Set(k, v)
+	}
+
+	// write request
+	_, err := h.w.Write(m.Body)
+
+	// flush the trailers
+	h.w.(http.Flusher).Flush()
+
+	return err
 }
 
 func (h *httpTransportSocket) error(m *Message) error {
-	b := bytes.NewBuffer(m.Body)
-	defer b.Reset()
-	rsp := &http.Response{
-		Header:        make(http.Header),
-		Body:          &buffer{b},
-		Status:        "500 Internal Server Error",
-		StatusCode:    500,
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		ContentLength: int64(len(m.Body)),
+	if h.r.ProtoMajor == 1 {
+		rsp := &http.Response{
+			Header:        make(http.Header),
+			Body:          ioutil.NopCloser(bytes.NewReader(m.Body)),
+			Status:        "500 Internal Server Error",
+			StatusCode:    500,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			ContentLength: int64(len(m.Body)),
+		}
+
+		for k, v := range m.Header {
+			rsp.Header.Set(k, v)
+		}
+
+		return rsp.Write(h.conn)
 	}
 
-	for k, v := range m.Header {
-		rsp.Header.Set(k, v)
-	}
-
-	return rsp.Write(h.conn)
+	return nil
 }
 
 func (h *httpTransportSocket) Close() error {
-	err := h.conn.Close()
-	h.once.Do(func() {
-		h.Lock()
-		h.buff.Reset(nil)
-		h.buff = nil
-		h.Unlock()
-	})
-	return err
+	h.mtx.Lock()
+	defer h.mtx.Unlock()
+	select {
+	case <-h.closed:
+		return nil
+	default:
+		// close the channel
+		close(h.closed)
+
+		// close the buffer
+		h.r.Body.Close()
+
+		// close the connection
+		if h.r.ProtoMajor == 1 {
+			return h.conn.Close()
+		}
+	}
+
+	return nil
 }
 
 func (h *httpTransportListener) Addr() string {
@@ -309,30 +388,87 @@ func (h *httpTransportListener) Close() error {
 }
 
 func (h *httpTransportListener) Accept(fn func(Socket)) error {
-	for {
-		c, err := h.listener.Accept()
-		if err != nil {
-			return err
+	// create handler mux
+	mux := http.NewServeMux()
+
+	// register our transport handler
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var buf *bufio.ReadWriter
+		var con net.Conn
+
+		// read a regular request
+		if r.ProtoMajor == 1 {
+			b, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			r.Body = ioutil.NopCloser(bytes.NewReader(b))
+			// hijack the conn
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				// we're screwed
+				http.Error(w, "cannot serve conn", http.StatusInternalServerError)
+				return
+			}
+
+			conn, bufrw, err := hj.Hijack()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer conn.Close()
+			buf = bufrw
+			con = conn
 		}
 
+		// buffered reader
+		bufr := bufio.NewReader(r.Body)
+
+		// save the request
+		ch := make(chan *http.Request, 1)
+		ch <- r
+
+		// create a new transport socket
 		sock := &httpTransportSocket{
-			conn: c,
-			buff: bufio.NewReader(c),
-			r:    make(chan *http.Request, 1),
+			ht:     h.ht,
+			w:      w,
+			r:      r,
+			rw:     buf,
+			buf:    bufr,
+			ch:     ch,
+			conn:   con,
+			local:  h.Addr(),
+			remote: r.RemoteAddr,
+			closed: make(chan bool),
 		}
 
-		go func() {
-			// TODO: think of a better error response strategy
-			defer func() {
-				if r := recover(); r != nil {
-					sock.Close()
-				}
-			}()
+		// execute the socket
+		fn(sock)
+	})
 
-			fn(sock)
-		}()
+	// get optional handlers
+	if h.ht.opts.Context != nil {
+		handlers, ok := h.ht.opts.Context.Value("http_handlers").(map[string]http.Handler)
+		if ok {
+			for pattern, handler := range handlers {
+				mux.Handle(pattern, handler)
+			}
+		}
 	}
-	return nil
+
+	// default http2 server
+	srv := &http.Server{
+		Handler: mux,
+	}
+
+	// insecure connection use h2c
+	if !(h.ht.opts.Secure || h.ht.opts.TLSConfig != nil) {
+		srv.Handler = h2c.NewHandler(mux, &http2.Server{})
+	}
+
+	// begin serving
+	return srv.Serve(h.listener)
 }
 
 func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
@@ -355,9 +491,14 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 				InsecureSkipVerify: true,
 			}
 		}
-		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: dopts.Timeout}, "tcp", addr, config)
+		config.NextProtos = []string{"http/1.1"}
+		conn, err = newConn(func(addr string) (net.Conn, error) {
+			return tls.DialWithDialer(&net.Dialer{Timeout: dopts.Timeout}, "tcp", addr, config)
+		})(addr)
 	} else {
-		conn, err = net.DialTimeout("tcp", addr, dopts.Timeout)
+		conn, err = newConn(func(addr string) (net.Conn, error) {
+			return net.DialTimeout("tcp", addr, dopts.Timeout)
+		})(addr)
 	}
 
 	if err != nil {
@@ -371,6 +512,8 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 		buff:     bufio.NewReader(conn),
 		dialOpts: dopts,
 		r:        make(chan *http.Request, 1),
+		local:    conn.LocalAddr().String(),
+		remote:   conn.RemoteAddr().String(),
 	}, nil
 }
 
@@ -389,7 +532,19 @@ func (h *httpTransport) Listen(addr string, opts ...ListenOption) (Listener, err
 
 		fn := func(addr string) (net.Listener, error) {
 			if config == nil {
-				cert, err := mls.Certificate(addr)
+				hosts := []string{addr}
+
+				// check if its a valid host:port
+				if host, _, err := net.SplitHostPort(addr); err == nil {
+					if len(host) == 0 {
+						hosts = maddr.IPs()
+					} else {
+						hosts = []string{host}
+					}
+				}
+
+				// generate a certificate
+				cert, err := mls.Certificate(hosts...)
 				if err != nil {
 					return nil, err
 				}
@@ -398,13 +553,13 @@ func (h *httpTransport) Listen(addr string, opts ...ListenOption) (Listener, err
 			return tls.Listen("tcp", addr, config)
 		}
 
-		l, err = listen(addr, fn)
+		l, err = mnet.Listen(addr, fn)
 	} else {
 		fn := func(addr string) (net.Listener, error) {
 			return net.Listen("tcp", addr)
 		}
 
-		l, err = listen(addr, fn)
+		l, err = mnet.Listen(addr, fn)
 	}
 
 	if err != nil {
@@ -412,15 +567,27 @@ func (h *httpTransport) Listen(addr string, opts ...ListenOption) (Listener, err
 	}
 
 	return &httpTransportListener{
+		ht:       h,
 		listener: l,
 	}, nil
+}
+
+func (h *httpTransport) Init(opts ...Option) error {
+	for _, o := range opts {
+		o(&h.opts)
+	}
+	return nil
+}
+
+func (h *httpTransport) Options() Options {
+	return h.opts
 }
 
 func (h *httpTransport) String() string {
 	return "http"
 }
 
-func newHttpTransport(opts ...Option) *httpTransport {
+func newHTTPTransport(opts ...Option) *httpTransport {
 	var options Options
 	for _, o := range opts {
 		o(&options)

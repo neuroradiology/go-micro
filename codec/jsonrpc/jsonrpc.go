@@ -1,3 +1,4 @@
+// Package jsonrpc provides a json-rpc 1.0 codec
 package jsonrpc
 
 import (
@@ -30,9 +31,9 @@ func (j *jsonCodec) Write(m *codec.Message, b interface{}) error {
 	switch m.Type {
 	case codec.Request:
 		return j.c.Write(m, b)
-	case codec.Response:
+	case codec.Response, codec.Error:
 		return j.s.Write(m, b)
-	case codec.Publication:
+	case codec.Event:
 		data, err := json.Marshal(b)
 		if err != nil {
 			return err
@@ -42,7 +43,6 @@ func (j *jsonCodec) Write(m *codec.Message, b interface{}) error {
 	default:
 		return fmt.Errorf("Unrecognised message type: %v", m.Type)
 	}
-	return nil
 }
 
 func (j *jsonCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error {
@@ -54,8 +54,9 @@ func (j *jsonCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error {
 		return j.s.ReadHeader(m)
 	case codec.Response:
 		return j.c.ReadHeader(m)
-	case codec.Publication:
-		io.Copy(j.buf, j.rwc)
+	case codec.Event:
+		_, err := io.Copy(j.buf, j.rwc)
+		return err
 	default:
 		return fmt.Errorf("Unrecognised message type: %v", mt)
 	}
@@ -68,7 +69,7 @@ func (j *jsonCodec) ReadBody(b interface{}) error {
 		return j.s.ReadBody(b)
 	case codec.Response:
 		return j.c.ReadBody(b)
-	case codec.Publication:
+	case codec.Event:
 		if b != nil {
 			return json.Unmarshal(j.buf.Bytes(), b)
 		}

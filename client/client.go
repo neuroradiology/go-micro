@@ -1,84 +1,115 @@
-/*
-The client package provides a method to make synchronous, asynchronous and
-streaming requests to services. By default json and protobuf codecs are
-supported.
-
-	import "github.com/micro/go-micro/client"
-
-	c := client.NewClient()
-
-	req := c.NewRequest("go.micro.srv.greeter", "Greeter.Hello", &greeter.Request{
-		Name: "John",
-	})
-
-	rsp := &greeter.Response{}
-
-	if err := c.Call(context.Background(), req, rsp); err != nil {
-		return err
-	}
-
-	fmt.Println(rsp.Msg)
-*/
+// Package client is an interface for an RPC client
 package client
 
 import (
+	"context"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/micro/go-micro/codec"
 )
 
 // Client is the interface used to make requests to services.
 // It supports Request/Response via Transport and Publishing via the Broker.
-// It also supports bidiectional streaming of requests.
+// It also supports bidirectional streaming of requests.
 type Client interface {
 	Init(...Option) error
 	Options() Options
-	NewPublication(topic string, msg interface{}) Publication
-	NewRequest(service, method string, req interface{}, reqOpts ...RequestOption) Request
-	NewProtoRequest(service, method string, req interface{}, reqOpts ...RequestOption) Request
-	NewJsonRequest(service, method string, req interface{}, reqOpts ...RequestOption) Request
+	NewMessage(topic string, msg interface{}, opts ...MessageOption) Message
+	NewRequest(service, endpoint string, req interface{}, reqOpts ...RequestOption) Request
 	Call(ctx context.Context, req Request, rsp interface{}, opts ...CallOption) error
-	CallRemote(ctx context.Context, addr string, req Request, rsp interface{}, opts ...CallOption) error
-	Stream(ctx context.Context, req Request, opts ...CallOption) (Streamer, error)
-	StreamRemote(ctx context.Context, addr string, req Request, opts ...CallOption) (Streamer, error)
-	Publish(ctx context.Context, p Publication, opts ...PublishOption) error
+	Stream(ctx context.Context, req Request, opts ...CallOption) (Stream, error)
+	Publish(ctx context.Context, msg Message, opts ...PublishOption) error
 	String() string
 }
 
-type Publication interface {
+// Router manages request routing
+type Router interface {
+	SendRequest(context.Context, Request) (Response, error)
+}
+
+// Message is the interface for publishing asynchronously
+type Message interface {
 	Topic() string
-	Message() interface{}
+	Payload() interface{}
 	ContentType() string
 }
 
+// Request is the interface for a synchronous request used by Call or Stream
 type Request interface {
+	// The service to call
 	Service() string
+	// The action to take
 	Method() string
+	// The endpoint to invoke
+	Endpoint() string
+	// The content type
 	ContentType() string
-	Request() interface{}
+	// The unencoded request body
+	Body() interface{}
+	// Write to the encoded request writer. This is nil before a call is made
+	Codec() codec.Writer
 	// indicates whether the request will be a streaming one rather than unary
 	Stream() bool
 }
 
-type Streamer interface {
+// Response is the response received from a service
+type Response interface {
+	// Read the response
+	Codec() codec.Reader
+	// read the header
+	Header() map[string]string
+	// Read the undecoded response
+	Read() ([]byte, error)
+}
+
+// Stream is the inteface for a bidirectional synchronous stream
+type Stream interface {
+	// Context for the stream
 	Context() context.Context
+	// The request made
 	Request() Request
+	// The response read
+	Response() Response
+	// Send will encode and send a request
 	Send(interface{}) error
+	// Recv will decode and read a response
 	Recv(interface{}) error
+	// Error returns the stream error
 	Error() error
+	// Close closes the stream
 	Close() error
 }
 
+// Option used by the Client
 type Option func(*Options)
+
+// CallOption used by Call or Stream
 type CallOption func(*CallOptions)
+
+// PublishOption used by Publish
 type PublishOption func(*PublishOptions)
+
+// MessageOption used by NewMessage
+type MessageOption func(*MessageOptions)
+
+// RequestOption used by NewRequest
 type RequestOption func(*RequestOptions)
 
 var (
+	// DefaultClient is a default client to use out of the box
 	DefaultClient Client = newRpcClient()
-
-	DefaultRetries        = 1
+	// DefaultBackoff is the default backoff function for retries
+	DefaultBackoff = exponentialBackoff
+	// DefaultRetry is the default check-for-retry function for retries
+	DefaultRetry = RetryOnError
+	// DefaultRetries is the default number of times a request is tried
+	DefaultRetries = 1
+	// DefaultRequestTimeout is the default request timeout
 	DefaultRequestTimeout = time.Second * 5
+	// DefaultPoolSize sets the connection pool size
+	DefaultPoolSize = 100
+	// DefaultPoolTTL sets the connection pool ttl
+	DefaultPoolTTL = time.Minute
 )
 
 // Makes a synchronous call to a service using the default client
@@ -86,26 +117,15 @@ func Call(ctx context.Context, request Request, response interface{}, opts ...Ca
 	return DefaultClient.Call(ctx, request, response, opts...)
 }
 
-// Makes a synchronous call to the specified address using the default client
-func CallRemote(ctx context.Context, address string, request Request, response interface{}, opts ...CallOption) error {
-	return DefaultClient.CallRemote(ctx, address, request, response, opts...)
-}
-
-// Creates a streaming connection with a service and returns responses on the
-// channel passed in. It's upto the user to close the streamer.
-func Stream(ctx context.Context, request Request, opts ...CallOption) (Streamer, error) {
-	return DefaultClient.Stream(ctx, request, opts...)
-}
-
-// Creates a streaming connection to the address specified.
-func StreamRemote(ctx context.Context, address string, request Request, opts ...CallOption) (Streamer, error) {
-	return DefaultClient.StreamRemote(ctx, address, request, opts...)
-}
-
 // Publishes a publication using the default client. Using the underlying broker
 // set within the options.
-func Publish(ctx context.Context, p Publication) error {
-	return DefaultClient.Publish(ctx, p)
+func Publish(ctx context.Context, msg Message, opts ...PublishOption) error {
+	return DefaultClient.Publish(ctx, msg, opts...)
+}
+
+// Creates a new message using the default client
+func NewMessage(topic string, payload interface{}, opts ...MessageOption) Message {
+	return DefaultClient.NewMessage(topic, payload, opts...)
 }
 
 // Creates a new client with the options passed in
@@ -113,25 +133,16 @@ func NewClient(opt ...Option) Client {
 	return newRpcClient(opt...)
 }
 
-// Creates a new publication using the default client
-func NewPublication(topic string, message interface{}) Publication {
-	return DefaultClient.NewPublication(topic, message)
-}
-
 // Creates a new request using the default client. Content Type will
 // be set to the default within options and use the appropriate codec
-func NewRequest(service, method string, request interface{}, reqOpts ...RequestOption) Request {
-	return DefaultClient.NewRequest(service, method, request, reqOpts...)
+func NewRequest(service, endpoint string, request interface{}, reqOpts ...RequestOption) Request {
+	return DefaultClient.NewRequest(service, endpoint, request, reqOpts...)
 }
 
-// Creates a new protobuf request using the default client
-func NewProtoRequest(service, method string, request interface{}, reqOpts ...RequestOption) Request {
-	return DefaultClient.NewProtoRequest(service, method, request, reqOpts...)
-}
-
-// Creates a new json request using the default client
-func NewJsonRequest(service, method string, request interface{}, reqOpts ...RequestOption) Request {
-	return DefaultClient.NewJsonRequest(service, method, request, reqOpts...)
+// Creates a streaming connection with a service and returns responses on the
+// channel passed in. It's up to the user to close the streamer.
+func NewStream(ctx context.Context, request Request, opts ...CallOption) (Stream, error) {
+	return DefaultClient.Stream(ctx, request, opts...)
 }
 
 func String() string {

@@ -2,14 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/micro/go-micro/broker"
 	"github.com/micro/go-micro/codec"
 	"github.com/micro/go-micro/metadata"
 	"github.com/micro/go-micro/registry"
-	"golang.org/x/net/context"
+	"github.com/micro/go-micro/util/buf"
 )
 
 const (
@@ -33,7 +35,10 @@ type subscriber struct {
 }
 
 func newSubscriber(topic string, sub interface{}, opts ...SubscriberOption) Subscriber {
-	var options SubscriberOptions
+	options := SubscriberOptions{
+		AutoAck: true,
+	}
+
 	for _, o := range opts {
 		o(&options)
 	}
@@ -122,8 +127,7 @@ func validateSubscriber(sub Subscriber) error {
 			return fmt.Errorf("subscriber %v argument type not exported: %v", name, argType)
 		}
 		if typ.NumOut() != 1 {
-			return fmt.Errorf(
-				"subscriber %v.%v has wrong number of outs: %v require signature %s",
+			return fmt.Errorf("subscriber %v has wrong number of outs: %v require signature %s",
 				name, typ.NumOut(), subSig)
 		}
 		if returnType := typ.Out(0); returnType != typeOfError {
@@ -162,20 +166,39 @@ func validateSubscriber(sub Subscriber) error {
 }
 
 func (s *rpcServer) createSubHandler(sb *subscriber, opts Options) broker.Handler {
-	return func(p broker.Publication) error {
+	return func(p broker.Event) error {
 		msg := p.Message()
+
+		if msg.Header == nil {
+			// create empty map in case of headers empty to avoid panic later
+			msg.Header = make(map[string]string)
+		}
+
+		// get codec
 		ct := msg.Header["Content-Type"]
+
+		// default content type
+		if len(ct) == 0 {
+			msg.Header["Content-Type"] = DefaultContentType
+			ct = DefaultContentType
+		}
+
+		// get codec
 		cf, err := s.newCodec(ct)
 		if err != nil {
 			return err
 		}
 
+		// copy headers
 		hdr := make(map[string]string)
 		for k, v := range msg.Header {
 			hdr[k] = v
 		}
-		delete(hdr, "Content-Type")
+
+		// create context
 		ctx := metadata.NewContext(context.Background(), hdr)
+
+		results := make(chan error, len(sb.handlers))
 
 		for i := 0; i < len(sb.handlers); i++ {
 			handler := sb.handlers[i]
@@ -193,11 +216,11 @@ func (s *rpcServer) createSubHandler(sb *subscriber, opts Options) broker.Handle
 				req = req.Elem()
 			}
 
-			b := &buffer{bytes.NewBuffer(msg.Body)}
+			b := buf.New(bytes.NewBuffer(msg.Body))
 			co := cf(b)
 			defer co.Close()
 
-			if err := co.ReadHeader(&codec.Message{}, codec.Publication); err != nil {
+			if err := co.ReadHeader(&codec.Message{}, codec.Event); err != nil {
 				return err
 			}
 
@@ -205,7 +228,7 @@ func (s *rpcServer) createSubHandler(sb *subscriber, opts Options) broker.Handle
 				return err
 			}
 
-			fn := func(ctx context.Context, msg Publication) error {
+			fn := func(ctx context.Context, msg Message) error {
 				var vals []reflect.Value
 				if sb.typ.Kind() != reflect.Func {
 					vals = append(vals, sb.rcvr)
@@ -214,7 +237,7 @@ func (s *rpcServer) createSubHandler(sb *subscriber, opts Options) broker.Handle
 					vals = append(vals, reflect.ValueOf(ctx))
 				}
 
-				vals = append(vals, reflect.ValueOf(msg.Message()))
+				vals = append(vals, reflect.ValueOf(msg.Payload()))
 
 				returnValues := handler.method.Call(vals)
 				if err := returnValues[0].Interface(); err != nil {
@@ -227,12 +250,35 @@ func (s *rpcServer) createSubHandler(sb *subscriber, opts Options) broker.Handle
 				fn = opts.SubWrappers[i-1](fn)
 			}
 
-			go fn(ctx, &rpcPublication{
-				topic:       sb.topic,
-				contentType: ct,
-				message:     req.Interface(),
-			})
+			if s.wg != nil {
+				s.wg.Add(1)
+			}
+
+			go func() {
+				if s.wg != nil {
+					defer s.wg.Done()
+				}
+
+				results <- fn(ctx, &rpcMessage{
+					topic:       sb.topic,
+					contentType: ct,
+					payload:     req.Interface(),
+				})
+			}()
 		}
+
+		var errors []string
+
+		for i := 0; i < len(sb.handlers); i++ {
+			if err := <-results; err != nil {
+				errors = append(errors, err.Error())
+			}
+		}
+
+		if len(errors) > 0 {
+			return fmt.Errorf("subscriber error: %s", strings.Join(errors, "\n"))
+		}
+
 		return nil
 	}
 }

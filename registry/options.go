@@ -1,10 +1,9 @@
 package registry
 
 import (
+	"context"
 	"crypto/tls"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
 type Options struct {
@@ -12,7 +11,6 @@ type Options struct {
 	Timeout   time.Duration
 	Secure    bool
 	TLSConfig *tls.Config
-
 	// Other options for implementations of the interface
 	// can be stored in a context
 	Context context.Context
@@ -20,6 +18,15 @@ type Options struct {
 
 type RegisterOptions struct {
 	TTL time.Duration
+	// Other options for implementations of the interface
+	// can be stored in a context
+	Context context.Context
+}
+
+type WatchOptions struct {
+	// Specify a service to watch
+	// If blank, the watch is for all services
+	Service string
 	// Other options for implementations of the interface
 	// can be stored in a context
 	Context context.Context
@@ -55,5 +62,12 @@ func TLSConfig(t *tls.Config) Option {
 func RegisterTTL(t time.Duration) RegisterOption {
 	return func(o *RegisterOptions) {
 		o.TTL = t
+	}
+}
+
+// Watch a service
+func WatchService(name string) WatchOption {
+	return func(o *WatchOptions) {
+		o.Service = name
 	}
 }
